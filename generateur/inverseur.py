@@ -1,206 +1,279 @@
-import numpy as np
-import sounddevice as sd
+"""
+ANNULEUR DE BRUIT PRO - VERSION PYO/ASIO
+Un suppresseur de bruit par inversion de phase utilisant Pyo pour une latence minimale
+et des performances optimales avec les pilotes ASIO.
+
+PARTIE 1: Importations et Classe principale
+"""
+
 import time
-from scipy import signal
-import threading
+import numpy as np
 import tkinter as tk
 from tkinter import ttk, messagebox
+import threading
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.animation as animation
-import queue
 from matplotlib.figure import Figure
-import concurrent.futures
-import colorsys
+import queue
+import os
+import sys
 
-class AnuleurDeBruitASIO:
+# Vérification et installation de Pyo si nécessaire
+try:
+    import pyo
+except ImportError:
+    print("La bibliothèque Pyo n'est pas installée. Tentative d'installation...")
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pyo"])
+    import pyo
+
+
+class AnuleurDeBruitPyoASIO:
+    """
+    Classe principale pour le suppresseur de bruit utilisant Pyo avec ASIO
+    """
     def __init__(self, 
                  taux_echantillonnage=96000,
-                 taille_tampon=64,  # Taille réduite pour moins de latence
+                 taille_tampon=64,
                  device_entree=None,
-                 device_sortie=None,
-                 api='asio'):
+                 device_sortie=None):
         """
-        Initialise le système d'annulation de bruit avec support ASIO
+        Initialise le système d'annulation de bruit avec Pyo et ASIO
         
         Args:
             taux_echantillonnage: Fréquence d'échantillonnage en Hz
-            taille_tampon: Nombre d'échantillons par trame (réduit pour moins de latence)
+            taille_tampon: Nombre d'échantillons par trame (buffer size)
             device_entree: Nom ou index du périphérique d'entrée
             device_sortie: Nom ou index du périphérique de sortie
-            api: API audio à utiliser ('asio' par défaut)
         """
         self.taux_echantillonnage = taux_echantillonnage
         self.taille_tampon = taille_tampon
         self.device_entree = device_entree
         self.device_sortie = device_sortie
-        self.api = api
         
         # Paramètres pour le filtrage et le traitement
-        self.delai_compensation = 0  # Délai pour compenser la latence du système
-        self.gain = 1.0  # Gain à appliquer au signal inversé
+        self.delai_ms = 8.0  # Délai en millisecondes (à ajuster)
+        self.gain = 0.95  # Gain à appliquer au signal inversé
         
-        # Filtres pour améliorer la performance
-        self.ordre_filtre = 2  # Ordre réduit pour moins de latence
-        self.freq_coupure_basse = 50  # Hz
-        self.freq_coupure_haute = 4000  # Hz
-        self.b, self.a = self._creer_filtre()
-        
-        # État du filtre
-        self.z = signal.lfilter_zi(self.b, self.a) * 0
-        
-        # Tampon pour stocker les échantillons précédents (pour le délai)
-        self.tampon_historique = np.zeros(self.taux_echantillonnage // 2)  # 0.5 seconde d'historique (réduit)
-        self.position_tampon = 0
-        
-        # Données pour affichage graphique
-        self.donnees_entree = np.zeros(1000)  # Plus de points pour un affichage plus fluide
-        self.donnees_sortie = np.zeros(1000)
-        
-        # Mesures de performance
-        self.temps_traitement = []
-        self.cpu_usage = 0
-        
-        # File d'attente pour les données audio
-        self.queue_audio = queue.Queue(maxsize=10)  # Taille réduite pour moins de latence
-        
-        # Traitement parallèle
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Paramètres du filtre passe-bande
+        self.freq_basse = 50  # Hz
+        self.freq_haute = 4000  # Hz
+        self.freq_centre = (self.freq_basse + self.freq_haute) / 2
+        self.q_factor = self.freq_centre / (self.freq_haute - self.freq_basse)
         
         # État d'exécution
         self.en_cours = False
+        self.serveur = None
         self.thread_traitement = None
-        self.stream = None
         
-        # Mode d'optimisation auto
-        self.mode_faible_latence = True
+        # Données pour affichage graphique (tampon circulaire)
+        self.buffer_size = 1000
+        self.donnees_entree = np.zeros(self.buffer_size)
+        self.donnees_sortie = np.zeros(self.buffer_size)
+        self.buffer_position = 0
+        
+        # Mesure des performances
+        self.cpu_usage = 0
+        self.latence_mesuree = 0
+        
+        # Créer la chaîne de traitement audio
+        self.input_stream = None
+        self.output_stream = None
+        self.filtre = None
+        self.inverseur = None
+        self.delai = None
+        self.mixeur = None
     
-    def _creer_filtre(self):
+    @staticmethod
+    def liste_peripheriques():
         """
-        Crée le filtre passe-bande avec mémorisation de l'état pour réduire la latence
+        Retourne la liste des périphériques audio disponibles via Pyo
         """
-        return signal.butter(
-            self.ordre_filtre, 
-            [self.freq_coupure_basse/(self.taux_echantillonnage/2), 
-             self.freq_coupure_haute/(self.taux_echantillonnage/2)], 
-            btype='band'
-        )
+        try:
+            # Créer un serveur temporaire pour lister les périphériques
+            temp_server = pyo.Server(duplex=0)
+            
+            # Obtenir la liste des périphériques
+            devices_in = temp_server.getInputDevices()
+            devices_out = temp_server.getOutputDevices()
+            
+            # Formater la liste des périphériques pour l'interface
+            device_list = []
+            device_info = {}
+            
+            # Périphériques d'entrée
+            for i, dev in enumerate(devices_in[1]):
+                name = dev
+                device_list.append((i, f"{name} (Entrée)"))
+                device_info[i] = {
+                    'name': name,
+                    'inputs': True,
+                    'outputs': False,
+                }
+            
+            # Périphériques de sortie
+            for i, dev in enumerate(devices_out[1]):
+                name = dev
+                device_list.append((i + len(devices_in[1]), f"{name} (Sortie)"))
+                device_info[i + len(devices_in[1])] = {
+                    'name': name,
+                    'inputs': False,
+                    'outputs': True,
+                }
+            
+            # Nettoyer le serveur temporaire
+            temp_server.shutdown()
+            
+            return device_list, device_info
+            
+        except Exception as e:
+            print(f"Erreur lors de la liste des périphériques: {e}")
+            return [], {}
     
-    def callback_audio(self, indata, outdata, frames, time_info, status):
-        """
-        Callback appelé par sounddevice pour traiter l'audio
-        """
-        # Note : 'time' dans le callback est en réalité un objet time_info, pas le module time
-        # Utilisons le module time importé globalement
-        debut_traitement = time.time()
-        
-        if status:
-            print(f"Statut audio: {status}")
-        
-        # Extraire les données audio mono (prendre la première colonne si stéréo)
-        donnees_audio = indata[:, 0] if indata.ndim > 1 else indata[:]
-        
-        # Stocker pour visualisation avec échantillonnage réduit pour économiser le CPU
-        if np.random.random() < 0.8:  # 80% du temps, on ignore l'échantillon pour l'affichage
-            self.donnees_entree = np.roll(self.donnees_entree, -len(donnees_audio))
-            if len(donnees_audio) < len(self.donnees_entree):
-                self.donnees_entree[-len(donnees_audio):] = donnees_audio
-            else:
-                self.donnees_entree = donnees_audio[-len(self.donnees_entree):]
-        
-        # Stocker les données dans le tampon d'historique circulaire de manière optimisée
-        taille_tampon = len(self.tampon_historique)
-        indices = np.mod(np.arange(self.position_tampon, self.position_tampon + len(donnees_audio)), taille_tampon)
-        self.tampon_historique[indices] = donnees_audio
-        self.position_tampon = (self.position_tampon + len(donnees_audio)) % taille_tampon
-        
-        # Appliquer un filtre passe-bande avec état mémorisé pour réduire la latence
-        donnees_filtrees, self.z = signal.lfilter(self.b, self.a, donnees_audio, zi=self.z)
-        
-        # Inverser la phase (multiplier par -1)
-        donnees_inversees = -self.gain * donnees_filtrees
-        
-        # Compensation de délai si nécessaire avec calcul vectorisé
-        if self.delai_compensation > 0:
-            position_delai = (self.position_tampon - self.delai_compensation) % taille_tampon
-            indices_retard = np.mod(np.arange(position_delai, position_delai + len(donnees_inversees)), taille_tampon)
-            donnees_retardees = self.tampon_historique[indices_retard]
-            
-            # Mélanger le signal retardé avec le signal inversé
-            donnees_sortie = donnees_retardees + donnees_inversees
-        else:
-            donnees_sortie = donnees_inversees
-        
-        # Limiter l'amplitude pour éviter la distorsion
-        donnees_sortie = np.clip(donnees_sortie, -0.95, 0.95)
-        
-        # Stocker pour visualisation (même technique d'échantillonnage réduit)
-        if np.random.random() < 0.8:
-            self.donnees_sortie = np.roll(self.donnees_sortie, -len(donnees_sortie))
-            if len(donnees_sortie) < len(self.donnees_sortie):
-                self.donnees_sortie[-len(donnees_sortie):] = donnees_sortie
-            else:
-                self.donnees_sortie = donnees_sortie[-len(self.donnees_sortie):]
-        
-        # Envoyer les données à la sortie audio (stéréo si nécessaire)
-        if outdata.ndim > 1:  # Si c'est multi-canal
-            # Remplir chaque canal avec le même signal
-            for i in range(outdata.shape[1]):
-                outdata[:, i] = donnees_sortie
-        else:
-            # Cas mono-canal
-            outdata.flat[:] = donnees_sortie
-            
-        # Mesurer le temps de traitement
-        fin_traitement = time.time()
-        temps_total = (fin_traitement - debut_traitement) * 1000  # en ms
-        self.temps_traitement.append(temps_total)
-        
-        # Garder seulement les 100 dernières mesures
-        if len(self.temps_traitement) > 100:
-            self.temps_traitement.pop(0)
-            
-        # Calculer l'utilisation CPU approximative
-        temps_disponible = (frames / self.taux_echantillonnage) * 1000  # ms disponibles par callback
-        self.cpu_usage = (np.mean(self.temps_traitement) / temps_disponible) * 100
-            
     def demarrer(self):
         """
-        Démarre le traitement audio avec ASIO
+        Démarre le traitement audio avec Pyo/ASIO
         """
         if not self.en_cours:
             try:
-                self.en_cours = True
+                print("Démarrage du serveur audio Pyo avec ASIO...")
                 
-                # Configurer et démarrer le stream
-                self.stream = sd.Stream(
-                    samplerate=self.taux_echantillonnage,
-                    blocksize=self.taille_tampon,
-                    device=(self.device_entree, self.device_sortie),
-                    channels=(1, 1),  # Mono pour simplifier
-                    callback=self.callback_audio,
-                    dtype='float32'
+                # Initialiser le serveur Pyo avec ASIO si disponible
+                self.serveur = pyo.Server(
+                    sr=self.taux_echantillonnage,
+                    buffersize=self.taille_tampon,
+                    duplex=1,  # Activer entrée et sortie
+                    audio='asio' if 'asio' in pyo.pa_get_host_apis() else 'portaudio',
+                    ichnls=1,  # 1 canal d'entrée (mono)
+                    ochnls=2,  # 2 canaux de sortie (stéréo)
+                    winhost="wasapi" if 'asio' not in pyo.pa_get_host_apis() else None
                 )
                 
-                # Démarrer le stream
-                self.stream.start()
-                print(f"Stream audio démarré avec les périphériques: {self.device_entree} -> {self.device_sortie}")
-                print(f"Latence d'entrée: {self.stream.latency[0]*1000:.2f}ms, Latence de sortie: {self.stream.latency[1]*1000:.2f}ms")
-                print(f"Latence totale estimée: {sum(self.stream.latency)*1000:.2f}ms")
+                # Configurer les périphériques si spécifiés
+                if self.device_entree is not None and self.device_sortie is not None:
+                    print(f"Configuration des périphériques: IN={self.device_entree}, OUT={self.device_sortie}")
+                    self.serveur.setInputDevice(self.device_entree)
+                    self.serveur.setOutputDevice(self.device_sortie)
                 
-                # Ajuster automatiquement le délai de compensation basé sur la latence mesurée
-                latence_totale = sum(self.stream.latency)
-                self.delai_compensation = int(latence_totale * self.taux_echantillonnage)
-                print(f"Délai de compensation auto-configuré: {self.delai_compensation} échantillons")
+                # Démarrer le serveur
+                self.serveur.boot()
+                
+                # Démarrer le stream audio
+                self.serveur.start()
+                
+                # Configuration de la chaîne de traitement audio
+                self._configurer_traitement()
+                
+                # Activer la récupération des données pour l'affichage
+                self._configurer_affichage()
+                
+                self.en_cours = True
+                
+                # Récupérer les informations de latence
+                latence_entree = self.serveur.getInputLatency() * 1000  # en ms
+                latence_sortie = self.serveur.getOutputLatency() * 1000  # en ms
+                self.latence_mesuree = latence_entree + latence_sortie
+                
+                print(f"Serveur audio démarré avec succès!")
+                print(f"Taux d'échantillonnage: {self.serveur.getSamplingRate()} Hz")
+                print(f"Taille du tampon: {self.serveur.getBufferSize()} échantillons")
+                print(f"Latence d'entrée: {latence_entree:.2f} ms")
+                print(f"Latence de sortie: {latence_sortie:.2f} ms")
+                print(f"Latence totale: {self.latence_mesuree:.2f} ms")
+                
+                # Démarrer un thread pour surveiller l'utilisation CPU
+                self.thread_traitement = threading.Thread(target=self._surveillance_cpu, daemon=True)
+                self.thread_traitement.start()
                 
                 return True
+                
             except Exception as e:
+                print(f"Erreur lors du démarrage du serveur audio: {str(e)}")
+                if self.serveur:
+                    self.serveur.shutdown()
+                    self.serveur = None
                 self.en_cours = False
-                print(f"Erreur lors du démarrage du stream audio: {str(e)}")
                 raise e
         
         return False
-            
+    def _configurer_traitement(self):
+        """
+        Configure la chaîne de traitement audio avec Pyo
+        """
+        if not self.serveur:
+            return
+        
+        # Créer le flux d'entrée
+        self.input_stream = pyo.Input(chnl=0)
+        
+        # Appliquer un filtre passe-bande pour isoler les fréquences d'intérêt
+        self.filtre = pyo.Biquad(
+            self.input_stream, 
+            freq=self.freq_centre, 
+            q=self.q_factor, 
+            type=2  # Type 2 = passe-bande
+        )
+        
+        # Inverser le signal (multiplier par -1)
+        self.inverseur = self.filtre * -self.gain
+        
+        # Appliquer un délai pour compenser la latence
+        self.delai = pyo.Delay(
+            self.inverseur,
+            delay=self.delai_ms / 1000.0,  # Convertir ms en secondes
+            feedback=0
+        )
+        
+        # Mélanger le signal original avec le signal inversé et retardé
+        self.mixeur = self.input_stream + self.delai
+        
+        # Envoyer vers la sortie
+        self.mixeur.out()
+    
+    def _configurer_affichage(self):
+        """
+        Configure la récupération des données pour l'affichage
+        """
+        if not self.serveur:
+            return
+        
+        # Créer des objets pour récupérer les données d'entrée et de sortie
+        self.tableau_entree = pyo.NewTable(self.buffer_size / self.taux_echantillonnage)
+        self.tableau_sortie = pyo.NewTable(self.buffer_size / self.taux_echantillonnage)
+        
+        # Enregistrer l'entrée et la sortie dans les tableaux
+        self.enregistreur_entree = pyo.TableRec(self.input_stream, self.tableau_entree, 
+                                              fadeout=0, loop=True)
+        self.enregistreur_sortie = pyo.TableRec(self.mixeur, self.tableau_sortie, 
+                                             fadeout=0, loop=True)
+        
+        # Démarrer l'enregistrement
+        self.enregistreur_entree.play()
+        self.enregistreur_sortie.play()
+        
+        # Fonction de rappel pour récupérer les données
+        def callback_donnees():
+            if self.en_cours:
+                # Récupérer les données des tableaux
+                self.donnees_entree = np.array(self.tableau_entree.getTable())
+                self.donnees_sortie = np.array(self.tableau_sortie.getTable())
+                
+                # Programmer le prochain appel (environ 30 fps)
+                self.serveur.CallAfter(0.033, callback_donnees)
+        
+        # Démarrer la récupération des données
+        self.serveur.CallAfter(0.1, callback_donnees)
+    
+    def _surveillance_cpu(self):
+        """
+        Surveillance continue de l'utilisation CPU
+        """
+        while self.en_cours:
+            if self.serveur:
+                self.cpu_usage = self.serveur.getStreamCpuLoad() * 100
+            time.sleep(1)
+    
     def arreter(self):
         """
         Arrête le traitement audio
@@ -208,159 +281,122 @@ class AnuleurDeBruitASIO:
         if self.en_cours:
             self.en_cours = False
             
-            if self.stream:
-                self.stream.stop()
-                self.stream.close()
-                self.stream = None
-                
-            print("Stream audio arrêté")
+            if self.serveur:
+                print("Arrêt du serveur audio...")
+                try:
+                    # Arrêter toute la chaîne de traitement
+                    if hasattr(self, 'mixeur') and self.mixeur:
+                        self.mixeur.stop()
+                    if hasattr(self, 'delai') and self.delai:
+                        self.delai.stop()
+                    if hasattr(self, 'inverseur') and self.inverseur:
+                        self.inverseur.stop()
+                    if hasattr(self, 'filtre') and self.filtre:
+                        self.filtre.stop()
+                    if hasattr(self, 'input_stream') and self.input_stream:
+                        self.input_stream.stop()
+                    
+                    # Arrêter les enregistreurs
+                    if hasattr(self, 'enregistreur_entree') and self.enregistreur_entree:
+                        self.enregistreur_entree.stop()
+                    if hasattr(self, 'enregistreur_sortie') and self.enregistreur_sortie:
+                        self.enregistreur_sortie.stop()
+                    
+                    # Arrêter et fermer le serveur
+                    self.serveur.stop()
+                    self.serveur.shutdown()
+                    self.serveur = None
+                except Exception as e:
+                    print(f"Erreur lors de l'arrêt du serveur: {e}")
             
-    def calibrer(self):
-        """
-        Fonction pour calibrer automatiquement le délai et le gain
-        """
-        print("Calibration en cours... Veuillez faire du bruit constant.")
-        
-        # Mesurer la latence réelle du système par analyse de corrélation
-        # Simuler un signal de test
-        duree_test = 0.5  # secondes
-        signal_test = np.sin(2 * np.pi * 440 * np.arange(int(duree_test * self.taux_echantillonnage)) / self.taux_echantillonnage)
-        
-        # Utilisez la latence reportée par le stream pour estimer le délai
-        if self.stream and hasattr(self.stream, 'latency'):
-            latence_totale = sum(self.stream.latency)
+            # Attendre la fin du thread de surveillance
+            if self.thread_traitement and self.thread_traitement.is_alive():
+                self.thread_traitement.join(timeout=1)
             
-            # Ajouter un peu plus pour compenser d'autres latences
-            latence_totale += 0.002  # +2ms pour la sécurité
-            
-            self.delai_compensation = int(latence_totale * self.taux_echantillonnage)
-        else:
-            # Valeur par défaut si la latence n'est pas disponible
-            self.delai_compensation = int(0.010 * self.taux_echantillonnage)  # 10ms de délai
-        
-        # Optimiser le gain en analysant brièvement le signal d'entrée et de sortie
-        if len(self.donnees_entree) > 0 and len(self.donnees_sortie) > 0:
-            # Calculer la puissance moyenne du signal d'entrée et de sortie
-            puissance_entree = np.mean(np.abs(self.donnees_entree)**2)
-            if puissance_entree > 0.001:  # S'assurer qu'il y a du signal
-                # Calculer le ratio optimal
-                ratio_optimal = 0.95  # Légèrement en dessous de 1 pour éviter les oscillations
-                self.gain = ratio_optimal
-            else:
-                self.gain = 0.95  # Valeur par défaut
-        else:
-            self.gain = 0.95
-            
-        print(f"Calibration terminée: délai={self.delai_compensation} échantillons ({self.delai_compensation/self.taux_echantillonnage*1000:.1f}ms), gain={self.gain}")
-        return self.delai_compensation, self.gain
-        
-    def regler_parametres(self, delai=None, gain=None, freq_basse=None, freq_haute=None, 
-                          ordre=None, taux_echant=None, taille_tampon=None, mode_faible_latence=None):
+            print("Serveur audio arrêté")
+    
+    def regler_parametres(self, delai=None, gain=None, freq_basse=None, freq_haute=None):
         """
-        Permet de régler manuellement les paramètres
+        Ajuste les paramètres du traitement en temps réel
         """
-        recalculer_filtre = False
-        redemarrer_stream = False
+        if not self.en_cours:
+            return
         
         if delai is not None:
-            self.delai_compensation = delai
+            self.delai_ms = delai
+            if self.delai:
+                self.delai.setDelay(self.delai_ms / 1000.0)
+        
         if gain is not None:
             self.gain = gain
-        if ordre is not None and ordre != self.ordre_filtre:
-            self.ordre_filtre = ordre
-            recalculer_filtre = True
-        if taux_echant is not None and taux_echant != self.taux_echantillonnage:
-            self.taux_echantillonnage = taux_echant
-            recalculer_filtre = True
-            redemarrer_stream = True
-        if taille_tampon is not None and taille_tampon != self.taille_tampon:
-            self.taille_tampon = taille_tampon
-            redemarrer_stream = True
-        if mode_faible_latence is not None:
-            self.mode_faible_latence = mode_faible_latence
-            # Si on active le mode faible latence, réduire l'ordre du filtre et la taille du tampon
-            if self.mode_faible_latence and self.ordre_filtre > 2:
-                self.ordre_filtre = 2
-                recalculer_filtre = True
-                if self.taille_tampon > 256:
-                    self.taille_tampon = 256
-                    redemarrer_stream = True
+            # Pour mettre à jour le gain, on doit reconfigurer l'inverseur
+            if self.inverseur and self.filtre:
+                self.inverseur = self.filtre * -self.gain
+                if self.delai:
+                    self.delai.setInput(self.inverseur)
         
-        # Mettre à jour le filtre si nécessaire
-        if freq_basse is not None or freq_haute is not None or recalculer_filtre:
+        if freq_basse is not None or freq_haute is not None:
             if freq_basse is not None:
-                self.freq_coupure_basse = freq_basse
+                self.freq_basse = freq_basse
             if freq_haute is not None:
-                self.freq_coupure_haute = freq_haute
-                
-            self.b, self.a = self._creer_filtre()
-            self.z = signal.lfilter_zi(self.b, self.a) * 0
+                self.freq_haute = freq_haute
             
-        # Redémarrer le stream si nécessaire
-        if redemarrer_stream and self.en_cours:
-            self.arreter()
-            time.sleep(0.5)  # Attendre un peu pour s'assurer que tout est fermé
-            self.demarrer()
+            # Recalculer les paramètres du filtre
+            self.freq_centre = (self.freq_basse + self.freq_haute) / 2
+            self.q_factor = self.freq_centre / (self.freq_haute - self.freq_basse)
+            
+            # Mettre à jour le filtre
+            if self.filtre:
+                self.filtre.setFreq(self.freq_centre)
+                self.filtre.setQ(self.q_factor)
+    
+    def calibrer(self):
+        """
+        Calibration automatique du délai et du gain
+        """
+        if not self.en_cours:
+            return self.delai_ms, self.gain
+        
+        print("Calibration en cours... Veuillez faire du bruit constant.")
+        
+        # Utiliser la latence mesurée du serveur pour estimer le délai
+        latence_entree = self.serveur.getInputLatency() * 1000  # en ms
+        latence_sortie = self.serveur.getOutputLatency() * 1000  # en ms
+        latence_totale = latence_entree + latence_sortie
+        
+        # Ajouter une marge pour compenser d'autres sources de latence
+        self.delai_ms = latence_totale + 2.0  # +2ms de marge
+        
+        # Mettre à jour le délai
+        if self.delai:
+            self.delai.setDelay(self.delai_ms / 1000.0)
+        
+        # Le gain reste à 0.95 pour éviter les oscillations
+        self.gain = 0.95
+        
+        print(f"Calibration terminée: délai={self.delai_ms:.1f}ms, gain={self.gain}")
+        return self.delai_ms, self.gain
     
     def fermer(self):
         """
-        Ferme proprement les flux audio
+        Ferme proprement toutes les ressources
         """
         self.arreter()
-        if hasattr(self, 'executor'):
-            self.executor.shutdown()
-        
-    @staticmethod
-    def liste_peripheriques():
-        """
-        Retourne une liste des périphériques audio disponibles
-        """
-        try:
-            devices = sd.query_devices()
-            api_info = sd.query_hostapis()
-            
-            # Formater la liste des périphériques pour l'interface
-            device_list = []
-            device_info = {}
-            
-            for i, dev in enumerate(devices):
-                name = dev['name']
-                host_api = api_info[dev['hostapi']]['name']
-                max_input_channels = dev['max_input_channels']
-                max_output_channels = dev['max_output_channels']
-                
-                # Ajouter les infos
-                device_info[i] = {
-                    'name': name,
-                    'host_api': host_api,
-                    'inputs': max_input_channels,
-                    'outputs': max_output_channels,
-                    'latency': dev.get('default_low_input_latency', 0) + dev.get('default_low_output_latency', 0)
-                }
-                
-                # Ajouter à la liste de sélection avec info de latence
-                if max_input_channels > 0:
-                    device_list.append((i, f"{name} - {host_api} (Entrée)"))
-                if max_output_channels > 0:
-                    device_list.append((i, f"{name} - {host_api} (Sortie)"))
-            
-            return device_list, device_info
-            
-        except Exception as e:
-            print(f"Erreur lors de la liste des périphériques: {e}")
-            return [], {}
 
-
-class InterfaceAnnuleurASIO(tk.Tk):
+class InterfaceAnnuleurPyo(tk.Tk):
+    """
+    Interface graphique pour l'annuleur de bruit avec Pyo
+    """
     def __init__(self):
         super().__init__()
         
-        self.title("Annuleur de Bruit Pro - Version ASIO Améliorée")
+        self.title("Annuleur de Bruit Pro - Version ASIO Turbo")
         self.geometry("950x750")
         
         # Thème moderne
         self.style = ttk.Style()
-        self.style.theme_use('clam')  # Utiliser un thème plus moderne
+        if 'clam' in self.style.theme_names():
+            self.style.theme_use('clam')
         
         # Configurer des couleurs modernes
         self.couleur_bg = "#2E3440"  # Fond sombre
@@ -378,12 +414,12 @@ class InterfaceAnnuleurASIO(tk.Tk):
         self.style.configure("TLabelframe.Label", background=self.couleur_bg, foreground=self.couleur_accent, font=('Arial', 11, 'bold'))
         self.style.configure("TLabel", background=self.couleur_bg, foreground=self.couleur_fg, font=('Arial', 10))
         self.style.configure("TButton", font=('Arial', 10, 'bold'))
-        self.style.configure("Accent.TButton", background=self.couleur_accent)
+        self.style.map("TButton", background=[("active", self.couleur_accent)])
         self.style.configure("Success.TButton", background=self.couleur_success)
         self.style.configure("Warning.TButton", background=self.couleur_warning)
         
         # Créer l'instance d'annuleur
-        self.annuleur = AnuleurDeBruitASIO(taille_tampon=256)  # Taille de tampon réduite pour moins de latence
+        self.annuleur = AnuleurDeBruitPyoASIO(taux_echantillonnage=96000, taille_tampon=64)
         
         # Créer l'interface
         self._create_widgets()
@@ -392,15 +428,16 @@ class InterfaceAnnuleurASIO(tk.Tk):
         self.ani = None
         self._start_animation()
         
-        # Compteur de performances
-        self.derniere_maj_perf = time.time()
+        # Mise à jour des performances
         self.after(1000, self._update_performances)
         
         # S'assurer que tout est fermé proprement
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
     
     def _create_widgets(self):
-        """Crée tous les widgets de l'interface"""
+        """
+        Crée tous les widgets de l'interface
+        """
         # Frame principale
         main_frame = ttk.Frame(self)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -409,11 +446,11 @@ class InterfaceAnnuleurASIO(tk.Tk):
         header_frame = ttk.Frame(main_frame)
         header_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        title_label = ttk.Label(header_frame, text="ANNULEUR DE BRUIT PRO", 
+        title_label = ttk.Label(header_frame, text="ANNULEUR DE BRUIT PRO - VERSION TURBO", 
                                font=('Arial', 16, 'bold'), foreground=self.couleur_accent)
         title_label.pack(side=tk.LEFT, padx=5)
         
-        version_label = ttk.Label(header_frame, text="v2.0", font=('Arial', 8))
+        version_label = ttk.Label(header_frame, text="v3.0", font=('Arial', 8))
         version_label.pack(side=tk.LEFT)
         
         # Indicateurs de performance
@@ -427,7 +464,7 @@ class InterfaceAnnuleurASIO(tk.Tk):
         self.cpu_label.pack(side=tk.RIGHT, padx=10)
         
         # ===== Section des périphériques =====
-        devices_frame = ttk.LabelFrame(main_frame, text="Périphériques Audio")
+        devices_frame = ttk.LabelFrame(main_frame, text="Périphériques Audio ASIO")
         devices_frame.pack(fill=tk.X, padx=5, pady=5)
         
         # Récupérer la liste des périphériques
@@ -471,24 +508,17 @@ class InterfaceAnnuleurASIO(tk.Tk):
         buttons_frame = ttk.Frame(controls_frame)
         buttons_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        self.start_button = ttk.Button(buttons_frame, text="▶ Démarrer", command=self._start_processing, style="Success.TButton")
+        self.start_button = ttk.Button(buttons_frame, text="▶ Démarrer", 
+                                    command=self._start_processing, style="Success.TButton")
         self.start_button.pack(side=tk.LEFT, padx=5, pady=5)
         
-        self.stop_button = ttk.Button(buttons_frame, text="⏹ Arrêter", command=self._stop_processing, state=tk.DISABLED)
+        self.stop_button = ttk.Button(buttons_frame, text="⏹ Arrêter", 
+                                   command=self._stop_processing, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5, pady=5)
         
-        self.calib_button = ttk.Button(buttons_frame, text="🔄 Calibrer", command=self._calibrate, style="Accent.TButton")
+        self.calib_button = ttk.Button(buttons_frame, text="🔄 Calibrer", 
+                                     command=self._calibrate, style="TButton")
         self.calib_button.pack(side=tk.LEFT, padx=5, pady=5)
-        
-        # Mode de latence
-        self.mode_latence_var = tk.BooleanVar(value=True)
-        self.mode_latence_check = ttk.Checkbutton(
-            buttons_frame, 
-            text="Mode faible latence", 
-            variable=self.mode_latence_var,
-            command=self._toggle_latency_mode
-        )
-        self.mode_latence_check.pack(side=tk.RIGHT, padx=15, pady=5)
         
         # ===== Section des paramètres =====
         params_frame = ttk.LabelFrame(main_frame, text="Paramètres")
@@ -510,14 +540,14 @@ class InterfaceAnnuleurASIO(tk.Tk):
         delai_controls = ttk.Frame(delai_frame)
         delai_controls.pack(fill=tk.X)
         
-        self.delai_var = tk.DoubleVar(value=5)
+        self.delai_var = tk.DoubleVar(value=8.0)
         self.scale_delai = ttk.Scale(
             delai_controls, from_=0, to=50, variable=self.delai_var, 
             command=lambda x: self._update_param_label('delai')
         )
         self.scale_delai.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
-        self.delai_label = ttk.Label(delai_controls, text="5.0 ms", width=8)
+        self.delai_label = ttk.Label(delai_controls, text="8.0 ms", width=8)
         self.delai_label.pack(side=tk.RIGHT, padx=5)
         
         # Gain - colonne gauche
@@ -600,7 +630,7 @@ class InterfaceAnnuleurASIO(tk.Tk):
         self.ax1 = self.fig.add_subplot(211)
         self.ax1.set_title("Signal d'entrée", color=self.couleur_fg)
         self.ax1.set_ylim(-1, 1)
-        self.ax1.set_xlim(0, 1000)  # Plus de points pour un affichage plus détaillé
+        self.ax1.set_xlim(0, 1000)
         self.ax1.grid(True, alpha=0.3)
         self.ax1.set_facecolor("#3B4252")  # Fond un peu plus clair
         self.ax1.tick_params(axis='x', colors=self.couleur_fg)
@@ -648,7 +678,7 @@ class InterfaceAnnuleurASIO(tk.Tk):
         )
         self.help_label.pack(side=tk.RIGHT, padx=5)
         self.help_label.bind("<Button-1>", self._show_help)
-        
+    
     def _update_param_label(self, param_name):
         """Met à jour les labels des sliders"""
         if param_name == 'delai':
@@ -698,7 +728,7 @@ class InterfaceAnnuleurASIO(tk.Tk):
                 
                 # Mettre à jour le status
                 self.status_label.config(
-                    text=f"Traitement en cours. Latence estimée: {sum(self.annuleur.stream.latency)*1000:.1f} ms"
+                    text=f"Traitement en cours. Latence estimée: {self.annuleur.latence_mesuree:.1f} ms"
                 )
             
         except Exception as e:
@@ -719,46 +749,15 @@ class InterfaceAnnuleurASIO(tk.Tk):
     
     def _apply_params(self):
         """Applique les paramètres actuels"""
-        # Convertir délai de ms à échantillons
-        delai_echant = int(self.delai_var.get() * self.annuleur.taux_echantillonnage / 1000)
-        
         self.annuleur.regler_parametres(
-            delai=delai_echant,
+            delai=self.delai_var.get(),
             gain=self.gain_var.get(),
             freq_basse=self.freq_basse_var.get(),
-            freq_haute=self.freq_haute_var.get(),
-            mode_faible_latence=self.mode_latence_var.get()
+            freq_haute=self.freq_haute_var.get()
         )
         
         self.status_label.config(text="Paramètres appliqués.")
-        
-    def _toggle_latency_mode(self):
-        """Bascule entre les modes de latence"""
-        if self.mode_latence_var.get():
-            # Mode faible latence
-            if self.annuleur.en_cours:
-                if messagebox.askyesno(
-                    "Mode faible latence", 
-                    "Le mode faible latence va redémarrer le stream audio avec des paramètres optimisés pour minimiser la latence. Continuer?"
-                ):
-                    self.annuleur.regler_parametres(mode_faible_latence=True)
-                else:
-                    self.mode_latence_var.set(False)
-        else:
-            # Mode qualité
-            if self.annuleur.en_cours:
-                if messagebox.askyesno(
-                    "Mode qualité", 
-                    "Le mode qualité va redémarrer le stream audio avec des paramètres optimisés pour une meilleure qualité audio. La latence peut augmenter. Continuer?"
-                ):
-                    self.annuleur.regler_parametres(
-                        mode_faible_latence=False,
-                        ordre=4,
-                        taille_tampon=512
-                    )
-                else:
-                    self.mode_latence_var.set(True)
-        
+    
     def _calibrate(self):
         """Lance la calibration automatique"""
         if not self.annuleur.en_cours:
@@ -770,15 +769,14 @@ class InterfaceAnnuleurASIO(tk.Tk):
             delai, gain = self.annuleur.calibrer()
             
             # Mettre à jour les sliders
-            delai_ms = delai * 1000 / self.annuleur.taux_echantillonnage
-            self.delai_var.set(delai_ms)
+            self.delai_var.set(delai)
             self.gain_var.set(gain)
             
             # Mettre à jour les labels
             self._update_param_label('delai')
             self._update_param_label('gain')
             
-            # Message de réussite avec animation
+            # Message de réussite
             self.status_label.config(text="Calibration terminée avec succès !")
             
         except Exception as e:
@@ -786,18 +784,15 @@ class InterfaceAnnuleurASIO(tk.Tk):
     
     def _update_performances(self):
         """Met à jour les indicateurs de performances"""
-        if self.annuleur.en_cours and hasattr(self.annuleur, 'stream') and self.annuleur.stream is not None:
-            # Calculer la latence totale
-            latence_totale = sum(self.annuleur.stream.latency) * 1000  # en ms
-            
+        if self.annuleur.en_cours:
             # Mettre à jour les labels
-            self.latence_label.config(text=f"Latence: {latence_totale:.1f} ms")
+            self.latence_label.config(text=f"Latence: {self.annuleur.latence_mesuree:.1f} ms")
             self.cpu_label.config(text=f"CPU: {self.annuleur.cpu_usage:.1f}%")
             
             # Colorer selon les performances
-            if latence_totale < 10:
+            if self.annuleur.latence_mesuree < 10:
                 self.latence_label.config(foreground=self.couleur_success)
-            elif latence_totale < 20:
+            elif self.annuleur.latence_mesuree < 20:
                 self.latence_label.config(foreground=self.couleur_accent)
             else:
                 self.latence_label.config(foreground=self.couleur_warning)
@@ -818,23 +813,22 @@ class InterfaceAnnuleurASIO(tk.Tk):
     
     def _update_plot(self, frame):
         """Met à jour le graphique en temps réel"""
-        if hasattr(self.annuleur, 'donnees_entree') and hasattr(self.annuleur, 'donnees_sortie'):
+        if self.annuleur.en_cours:
             self.line1.set_ydata(self.annuleur.donnees_entree)
             self.line2.set_ydata(self.annuleur.donnees_sortie)
-            return self.line1, self.line2
         return self.line1, self.line2
     
     def _start_animation(self):
         """Démarre l'animation pour le graphique en temps réel"""
         self.ani = animation.FuncAnimation(
-            self.fig, self._update_plot, interval=50,
+            self.fig, self._update_plot, interval=33,  # ~30 fps
             blit=True, cache_frame_data=False
         )
     
     def _show_help(self, event=None):
         """Affiche l'aide sur l'utilisation de l'application"""
         help_text = """
-        Guide d'utilisation de l'Annuleur de Bruit Pro
+        Guide d'utilisation de l'Annuleur de Bruit Pro - Version ASIO Turbo
         
         1. Sélection des périphériques:
            - Choisissez votre micro comme entrée
@@ -846,14 +840,16 @@ class InterfaceAnnuleurASIO(tk.Tk):
            - Calibrer: ajuste automatiquement les paramètres
         
         3. Paramètres:
-           - Délai: compense la latence du système (5-15ms recommandé)
+           - Délai: compense la latence du système (3-10ms recommandé)
            - Gain: intensité de l'annulation (0.8-1.0 recommandé)
            - Fréquences: ajuste la plage de fréquences à traiter
         
-        4. Conseils:
-           - Le mode faible latence réduit le délai mais peut diminuer la qualité
-           - Pour de meilleurs résultats, calibrez après chaque démarrage
-           - Si vous entendez des oscillations, réduisez le gain
+        4. Astuces pour une latence minimale:
+           - Utilisez de vrais périphériques ASIO si disponibles
+           - Sélectionnez un taux d'échantillonnage élevé (96kHz)
+           - Fermez les applications gourmandes en CPU
+           - Pour les bruits constants (ventilateurs, ronronnements), utilisez un délai plus élevé
+           - Pour les bruits variables, privilégiez un délai plus court
         
         Bon travail de suppression de bruit !
         """
@@ -925,30 +921,35 @@ class InterfaceAnnuleurASIO(tk.Tk):
 
 
 if __name__ == "__main__":
-    print("=== Annuleur de Bruit Pro - Version ASIO Améliorée ===")
-    print("Initialisation du système d'annulation de bruit...")
+    print("=== Annuleur de Bruit Pro - Version ASIO Turbo ===")
+    print("Initialisation du système d'annulation de bruit avec Pyo...")
     
-    # Lister les périphériques et APIs disponibles
-    print("\n===== PÉRIPHÉRIQUES AUDIO DISPONIBLES =====")
+    # Vérifier si Pyo est installé
     try:
-        devices = sd.query_devices()
-        for i, device in enumerate(devices):
-            print(f"[{i}] {device['name']}")
-            print(f"    Entrées: {device['max_input_channels']}, Sorties: {device['max_output_channels']}")
-            print(f"    Taux d'échantillonnage par défaut: {device['default_samplerate']} Hz")
-            print(f"    Latence minimale: {device.get('default_low_input_latency', 0)*1000:.1f}/{device.get('default_low_output_latency', 0)*1000:.1f} ms (in/out)")
-            print()
-            
-        print("===== APIs AUDIO DISPONIBLES =====")
-        apis = sd.query_hostapis()
+        import pyo
+        print(f"Pyo version {pyo.getVersion()} trouvée.")
+        
+        # Lister les APIs audio disponibles
+        apis = pyo.pa_get_host_apis()
+        print("\n===== APIs AUDIO DISPONIBLES =====")
         for i, api in enumerate(apis):
-            print(f"[{i}] {api['name']}")
-            print(f"    Périphériques: {len(api['devices'])}")
-            print(f"    Périph. par défaut: {api['default_input_device']}/{api['default_output_device']}")
-            print()
-    except Exception as e:
-        print(f"Erreur lors de la liste des périphériques: {e}")
+            print(f"[{i}] {api}")
+        
+        # Vérifier si ASIO est disponible
+        if 'asio' in apis:
+            print("\nAPI ASIO détectée ! Performances optimales disponibles. 🎉")
+        else:
+            print("\nAPI ASIO non détectée. Les performances seront limitées.")
+            print("Vous pouvez installer ASIO4ALL pour de meilleures performances.")
+        
+    except ImportError:
+        print("La bibliothèque Pyo n'est pas installée.")
+        print("Installation automatique en cours...")
+        import subprocess
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "pyo"])
+        print("Pyo installé avec succès ! Redémarrez l'application.")
+        sys.exit(0)
     
     # Démarrer l'interface
-    app = InterfaceAnnuleurASIO()
+    app = InterfaceAnnuleurPyo()
     app.mainloop()
